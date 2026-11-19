@@ -127,6 +127,9 @@ const (
 	// that CubeMaster passes to cubelet for envd initialization.
 	CubeAnnotationCreateTimeEnvVars = "cube.master.internal.create_time_env_vars"
 	CubeAnnotationEnableIvshmem     = "cube.master.enable_ivshmem"
+	// CubeAnnotationVMKernelCmdlineAppend carries extra guest kernel command
+	// line params as a JSON array of strings; CubeShim appends them.
+	CubeAnnotationVMKernelCmdlineAppend = "cube.vm.kernel.cmdline.append"
 
 	CubeAnnotationsVirtiofsCache = "cube.master.virtiofs.cache"
 

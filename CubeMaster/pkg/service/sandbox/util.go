@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"unicode"
@@ -36,8 +38,12 @@ import (
 
 const (
 	maxCreateTimeEnvVarsAnnotationBytes = 16 * 1024
-	maxMaskRequestHostBytes             = 512
-	maskRequestHostPortPlaceholder      = "${PORT}"
+	// maxVMKernelCmdlineBytes bounds the whole annotation well below the
+	// smallest guest cmdline buffer (aarch64: 2048 bytes), leaving room for
+	// the video params and the auto-filled monitor region.
+	maxVMKernelCmdlineBytes        = 1024
+	maxMaskRequestHostBytes        = 512
+	maskRequestHostPortPlaceholder = "${PORT}"
 )
 
 func checkAndGetReqResource(req *types.CreateCubeSandboxReq) (*selctx.RequestResource, error) {
@@ -576,9 +582,64 @@ func getExposedPorts(req *types.CreateCubeSandboxReq, out *cubebox.RunCubeSandbo
 	}
 	return nil
 }
+
+// containerNeedsDamonRegion reports whether the first container asks for DAMON
+// kernel params. Only the first container's annotation reaches the sandbox
+// spec, so only it can request the monitor region auto-fill.
+func containerNeedsDamonRegion(containers []*types.Container) bool {
+	if len(containers) == 0 || containers[0] == nil || containers[0].Annotations == nil {
+		return false
+	}
+	raw, ok := containers[0].Annotations[constants.CubeAnnotationVMKernelCmdlineAppend]
+	if !ok {
+		return false
+	}
+	// Auto-fill only applies to DAMON params; page_reporting.* entries leave
+	// the region untouched, so a page_reporting-only list must not trigger the
+	// memory sum (and its positive-memory validation).
+	var params []string
+	if err := json.Unmarshal([]byte(raw), &params); err != nil {
+		// Malformed input is reported by FilterVMKernelCmdline.
+		return false
+	}
+	for _, p := range params {
+		if strings.HasPrefix(strings.TrimSpace(p), "damon_reclaim.") {
+			return true
+		}
+	}
+	return false
+}
+
+// autoFillRegionFor reports whether the monitor region can be derived from the
+// container memory sum. An empty InstanceType means the cubebox default, which
+// matches injectEnvdSidecar; every other type adds VMM overhead on top of the
+// sum, so its region must be supplied explicitly.
+func autoFillRegionFor(instanceType string) bool {
+	return instanceType == "" || instanceType == cubebox.InstanceType_cubebox.String()
+}
+
 func checkAndGetContainers(req *types.CreateCubeSandboxReq, out *cubebox.RunCubeSandboxRequest) error {
 
-	for _, cnt := range req.Containers {
+	// The guest VM RAM equals the sum of all containers' memory requests only
+	// for the "cubebox" instance type. Every other type adds the VMM overhead
+	// computed by Cubelet's cgroup.GetResourceWithOverhead, so a region derived
+	// from the raw sum would stop short of the actual top of RAM. The region is
+	// baked into the snapshot's guest cmdline and cannot be corrected later, so
+	// auto-fill only applies to "cubebox"; other instance types must pass
+	// monitor_region_start/end explicitly. The sum is computed lazily so
+	// requests without the annotation keep their previous behaviour and skip
+	// parsing every container's memory.
+	autoFillRegion := autoFillRegionFor(req.InstanceType)
+	var totalMemBytes uint64
+	if autoFillRegion && containerNeedsDamonRegion(req.Containers) {
+		var err error
+		totalMemBytes, err = sumContainerMemory(req.Containers)
+		if err != nil {
+			return err
+		}
+	}
+
+	for i, cnt := range req.Containers {
 		if cnt.Resources == nil {
 			return errors.New("request Resources nil")
 		}
@@ -631,7 +692,7 @@ func checkAndGetContainers(req *types.CreateCubeSandboxReq, out *cubebox.RunCube
 		if err := checkAndGetProbe(c, cnt); err != nil {
 			return err
 		}
-		if err := checkAndGetContainerAnnotation(c, cnt); err != nil {
+		if err := checkAndGetContainerAnnotation(c, cnt, totalMemBytes, autoFillRegion, i == 0); err != nil {
 			return err
 		}
 		if err := checkAndGetContainerHooks(c, cnt); err != nil {
@@ -668,7 +729,293 @@ func checkAndGetImageSpec(c *cubebox.ContainerConfig, cnt *types.Container) erro
 	return nil
 }
 
-func checkAndGetContainerAnnotation(c *cubebox.ContainerConfig, cnt *types.Container) error {
+// allowedVMKernelCmdlinePattern matches a single kernel cmdline entry whose
+// module is allowlisted, e.g. "page_reporting.page_reporting_order=6".
+// Matching the whole entry (not just the prefix) rejects embedded whitespace
+// that would otherwise smuggle extra tokens into the guest cmdline.
+var allowedVMKernelCmdlinePattern = regexp.MustCompile(
+	`^(page_reporting|damon_reclaim)\.[A-Za-z0-9_.]+(=[A-Za-z0-9_,.:/-]*)?$`)
+
+// FilterVMKernelCmdline parses a JSON array of strings and keeps only
+// allowlisted module params. Exported so the CLI can validate early.
+func FilterVMKernelCmdline(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if len(raw) > maxVMKernelCmdlineBytes {
+		return "", fmt.Errorf("kernel cmdline append is %d bytes, exceeds the %d-byte limit",
+			len(raw), maxVMKernelCmdlineBytes)
+	}
+	var params []string
+	if err := json.Unmarshal([]byte(raw), &params); err != nil {
+		return "", fmt.Errorf("kernel cmdline append must be a JSON array of strings: %w", err)
+	}
+	out := make([]string, 0, len(params))
+	for _, p := range params {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !allowedVMKernelCmdlinePattern.MatchString(p) {
+			return "", fmt.Errorf("kernel cmdline param %q is not allowed", p)
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// damonMonitorRegion returns the guest physical address range DAMON must
+// monitor: the kernel's default single-block pick misses RAM above the PCI
+// hole. The values mirror the memory map built by CubeSandbox's in-tree VMM
+// (hypervisor/arch/src/{x86_64,aarch64}/mod.rs arch_memory_regions), which
+// CubeShim embeds.
+//
+// The guest physical memory map is arch-specific, and CubeSandbox has no
+// arch-aware placement: templates, nodes, requests and images carry no arch
+// field, and the scheduler does not filter by arch. A supported cluster is
+// therefore homogeneous, so the guest arch always equals the arch CubeMaster
+// was built for. Clusters that mix control-plane and worker architectures are
+// not supported; pass monitor_region_start/end explicitly there.
+//
+// TODO: derive the guest arch from the target node/template once an arch field
+// exists; until then ensureDamonMonitorRegion passes runtime.GOARCH, and
+// mixed-arch clusters must pass monitor_region_start/end explicitly.
+func damonMonitorRegion(goarch string, memBytes uint64) (start, end uint64, ok bool) {
+	const gib = uint64(1) << 30
+	if memBytes == 0 {
+		return 0, 0, false
+	}
+	switch goarch {
+	case "amd64":
+		// x86_64 keeps RAM contiguous up to 3 GiB, then skips the 3-4 GiB
+		// 32-bit device hole and resumes at 4 GiB, so the top of RAM is size
+		// below the hole and size + 1 GiB above it.
+		if memBytes <= 3*gib {
+			end = memBytes
+		} else {
+			end = memBytes + gib
+		}
+		// DAMON treats monitor_region_start=0 as "unset", so start at the
+		// first page; the 4 KiB below it carries no RAM.
+		return 4096, end, true
+	case "arm64":
+		// aarch64 starts RAM at 1 GiB (RAM_START) and skips a 64 MiB hole at
+		// 3.9375 GiB (MEM_32BIT_RESERVED_START) before resuming at 4 GiB
+		// (RAM_64BIT_START), so the top of RAM is size + 1 GiB below the hole
+		// and size + 1.0625 GiB above it.
+		const (
+			ramStart   = uint64(0x4000_0000)   // 1 GiB
+			holeStart  = uint64(0xfc00_0000)   // 3.9375 GiB
+			ram64Start = uint64(0x1_0000_0000) // 4 GiB
+		)
+		ram32bitSpace := holeStart - ramStart // 2.9375 GiB
+		if memBytes <= ram32bitSpace {
+			end = ramStart + memBytes
+		} else {
+			end = ram64Start + (memBytes - ram32bitSpace)
+		}
+		return ramStart, end, true
+	}
+	return 0, 0, false
+}
+
+// isZeroBound reports whether a monitor_region bound is a zero placeholder
+// that should be recomputed. Parsing is numeric to match how the kernel parses
+// module params: "0", "00" and "0x0" are all zero. An empty value is also a
+// placeholder, while a non-numeric value is left as an explicit bound.
+func isZeroBound(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return true
+	}
+	n, err := strconv.ParseUint(value, 0, 64)
+	return err == nil && n == 0
+}
+
+// ensureDamonMonitorRegion fills missing monitor_region bounds from the
+// sandbox-wide guest memory; explicit non-zero bounds are preserved.
+func ensureDamonMonitorRegion(raw string, memBytes uint64) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	var params []string
+	if err := json.Unmarshal([]byte(raw), &params); err != nil {
+		return "", fmt.Errorf("kernel cmdline append must be a JSON array of strings: %w", err)
+	}
+
+	const (
+		startPrefix = "damon_reclaim.monitor_region_start="
+		endPrefix   = "damon_reclaim.monitor_region_end="
+	)
+	var hasDamon, hasStart, hasEnd, zeroStart, zeroEnd bool
+	var rawStart, rawEnd string
+	for _, p := range params {
+		p = strings.TrimSpace(p)
+		if strings.HasPrefix(p, "damon_reclaim.") {
+			hasDamon = true
+		}
+		switch {
+		case strings.HasPrefix(p, startPrefix):
+			hasStart = true
+			rawStart = strings.TrimPrefix(p, startPrefix)
+			zeroStart = isZeroBound(rawStart)
+		case strings.HasPrefix(p, endPrefix):
+			hasEnd = true
+			rawEnd = strings.TrimPrefix(p, endPrefix)
+			zeroEnd = isZeroBound(rawEnd)
+		}
+	}
+	// No DAMON param requested: leave the list untouched.
+	if !hasDamon {
+		return raw, nil
+	}
+
+	start, end, ok := damonMonitorRegion(runtime.GOARCH, memBytes)
+	if !ok {
+		// No region can be computed for this arch/size; leave the annotation
+		// exactly as the caller wrote it, zero placeholders included.
+		return raw, nil
+	}
+
+	// Explicit non-zero bounds win over the computed region; resolve the
+	// effective pair so an out-of-range override is rejected instead of being
+	// written into the guest cmdline (where damon_reclaim would fail silently).
+	effStart, effEnd := start, end
+	if hasStart && !zeroStart {
+		v, err := strconv.ParseUint(strings.TrimSpace(rawStart), 0, 64)
+		if err != nil {
+			return "", fmt.Errorf("%s%s must be a decimal or 0x-prefixed integer: %w",
+				startPrefix, rawStart, err)
+		}
+		effStart = v
+	}
+	if hasEnd && !zeroEnd {
+		v, err := strconv.ParseUint(strings.TrimSpace(rawEnd), 0, 64)
+		if err != nil {
+			return "", fmt.Errorf("%s%s must be a decimal or 0x-prefixed integer: %w",
+				endPrefix, rawEnd, err)
+		}
+		effEnd = v
+	}
+	if effStart >= effEnd {
+		return "", fmt.Errorf("damon_reclaim monitor region start %d must be less than end %d",
+			effStart, effEnd)
+	}
+
+	kept := make([]string, 0, len(params)+2)
+	for _, p := range params {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// Drop zero placeholders; they are recomputed below.
+		if (zeroStart && strings.HasPrefix(p, startPrefix)) ||
+			(zeroEnd && strings.HasPrefix(p, endPrefix)) {
+			continue
+		}
+		kept = append(kept, p)
+	}
+
+	// Each bound is filled independently, so a single missing bound is
+	// still supplied from the computed region.
+	if !hasStart || zeroStart {
+		kept = append(kept, fmt.Sprintf("%s%d", startPrefix, start))
+	}
+	if !hasEnd || zeroEnd {
+		kept = append(kept, fmt.Sprintf("%s%d", endPrefix, end))
+	}
+	return marshalKernelParams(kept)
+}
+
+func marshalKernelParams(params []string) (string, error) {
+	if len(params) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(params)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// sumContainerMemory returns the total guest memory request across containers.
+// A missing Resources entry contributes zero; a malformed or negative value is
+// returned as an error, while a zero request contributes exactly zero.
+func sumContainerMemory(containers []*types.Container) (uint64, error) {
+	var total uint64
+	for _, cnt := range containers {
+		if cnt == nil || cnt.Resources == nil {
+			continue
+		}
+		n, err := parseMemoryBytes(cnt.Resources.Mem)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// parseMemoryBytes converts a memory spec such as "4096Mi" or "4Gi" to bytes.
+// An empty or negative value, or one that does not parse, is an error. A zero
+// request is allowed: it contributes nothing to the sum, so rejecting it here
+// would narrow the accepted request set for multi-container sandboxes.
+func parseMemoryBytes(memStr string) (uint64, error) {
+	memStr = strings.TrimSpace(memStr)
+	if memStr == "" {
+		return 0, fmt.Errorf("memory request is empty")
+	}
+	q, err := resource.ParseQuantity(memStr)
+	if err != nil {
+		return 0, fmt.Errorf("parse memory %q: %w", memStr, err)
+	}
+	v := q.Value()
+	if v < 0 {
+		return 0, fmt.Errorf("memory %q must not be negative", memStr)
+	}
+	return uint64(v), nil
+}
+
+func checkAndGetContainerAnnotation(c *cubebox.ContainerConfig, cnt *types.Container,
+	totalMemBytes uint64, autoFillRegion, isFirst bool) error {
+	// This annotation lives outside the cube.master.* namespace but must
+	// reach CubeShim; validate and normalize it before the loop below drops it.
+	if raw, ok := cnt.Annotations[constants.CubeAnnotationVMKernelCmdlineAppend]; ok {
+		// The guest kernel command line is sandbox-wide and only the first
+		// container's annotations are copied into the sandbox spec, so an
+		// annotation on any other container would be silently dropped.
+		if !isFirst {
+			return fmt.Errorf("annotation %q must be set on the first container; "+
+				"the guest kernel command line is sandbox-wide",
+				constants.CubeAnnotationVMKernelCmdlineAppend)
+		}
+		filtered, err := FilterVMKernelCmdline(raw)
+		if err != nil {
+			return err
+		}
+		// The monitor region is only meaningful for the cubebox instance type;
+		// other types have a different guest RAM size and must supply explicit
+		// bounds, so leave their annotation as-is.
+		if autoFillRegion && filtered != "" {
+			filtered, err = ensureDamonMonitorRegion(filtered, totalMemBytes)
+			if err != nil {
+				return err
+			}
+		}
+		if filtered != "" {
+			c.Annotations[constants.CubeAnnotationVMKernelCmdlineAppend] = filtered
+		}
+	}
+
 	for k, v := range cnt.Annotations {
 
 		if !strings.HasPrefix(k, "cube.") &&
@@ -1014,6 +1361,15 @@ func checkAndGetHostDirVolumeSource(src *types.HostDirVolumeSources, out *cubebo
 func checkAndGetAnnotation(req *types.CreateCubeSandboxReq, out *cubebox.RunCubeSandboxRequest) error {
 	if req.Annotations == nil {
 		return errors.New("annotation param is nil")
+	}
+
+	// The guest kernel command line is sandbox-wide, but this annotation has no
+	// passthrough from the sandbox request to the shim; it is read from the
+	// first container's annotations instead. Reject a sandbox-level value so it
+	// is not silently dropped.
+	if _, ok := req.Annotations[constants.CubeAnnotationVMKernelCmdlineAppend]; ok {
+		return fmt.Errorf("annotation %q must be set on the first container, not the sandbox request",
+			constants.CubeAnnotationVMKernelCmdlineAppend)
 	}
 
 	if out.Annotations == nil {
